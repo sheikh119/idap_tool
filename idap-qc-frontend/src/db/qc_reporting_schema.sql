@@ -66,7 +66,11 @@ BEGIN
               'trg_fn_report_status_history',
               'trg_fn_protect_approved_report',
               'trg_fn_history_append_only',
-              'trg_fn_report_section_order'
+              'trg_fn_report_section_order',
+              'trg_fn_report_children_editable',
+              'api_report_workflow',
+              'api_update_issue',
+              'api_renumber_observations'
           )
     LOOP
         EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', r.sig);
@@ -809,7 +813,13 @@ BEGIN
     IF NEW.status IS DISTINCT FROM OLD.status THEN
         actor := coalesce(fn_current_user_id(), NEW.reported_by);
         INSERT INTO issue_history (issue_id, changed_by, old_status, new_status, comment)
-        VALUES (NEW.id, actor, OLD.status, NEW.status, NULL);
+        VALUES (
+            NEW.id,
+            actor,
+            OLD.status,
+            NEW.status,
+            nullif(current_setting('app.status_comment', true), '')
+        );
     END IF;
 
     RETURN NEW;
@@ -1211,6 +1221,40 @@ CREATE TRIGGER trg_issue_history_append_only
 CREATE TRIGGER trg_report_history_append_only
     BEFORE UPDATE OR DELETE ON report_history
     FOR EACH ROW EXECUTE FUNCTION trg_fn_history_append_only();
+
+-- Sections/observations may only change while the report is DRAFT, REJECTED or REOPENED
+CREATE OR REPLACE FUNCTION trg_fn_report_children_editable()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_report_id uuid;
+    v_status report_status;
+BEGIN
+    v_report_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.report_id ELSE NEW.report_id END;
+
+    SELECT status INTO v_status FROM reports WHERE id = v_report_id;
+
+    -- Parent already gone (cascade delete of the report itself)
+    IF NOT FOUND THEN
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END IF;
+
+    IF v_status NOT IN ('DRAFT', 'REJECTED', 'REOPENED') THEN
+        RAISE EXCEPTION 'Report is % and cannot be edited (only DRAFT, REJECTED or REOPENED)', v_status;
+    END IF;
+
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER trg_report_sections_editable
+    BEFORE INSERT OR UPDATE OR DELETE ON report_sections
+    FOR EACH ROW EXECUTE FUNCTION trg_fn_report_children_editable();
+
+CREATE TRIGGER trg_report_issues_editable
+    BEFORE INSERT OR UPDATE OR DELETE ON report_issues
+    FOR EACH ROW EXECUTE FUNCTION trg_fn_report_children_editable();
 
 -- =============================================================================
 -- 7. WORKFLOW PROCEDURES
@@ -1783,6 +1827,131 @@ LEFT JOIN reports r
     ON r.project_id = pr.id
    AND (pk.id IS NULL OR r.package_id = pk.id OR r.package_id IS NULL)
 GROUP BY pr.id, pr.project_code, pr.name, pk.id, pk.package_code, pk.name;
+
+-- =============================================================================
+-- 8b. API FUNCTIONS (callable through Supabase RPC)
+--   PostgREST cannot CALL procedures, and each request is its own transaction,
+--   so these wrappers set the acting user and run the work in one transaction.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION api_report_workflow(
+    p_report_id uuid,
+    p_actor_id uuid,
+    p_action text,
+    p_comment text DEFAULT NULL
+)
+RETURNS reports
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    r reports%ROWTYPE;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM reports WHERE id = p_report_id) THEN
+        RAISE EXCEPTION 'Report % not found', p_report_id USING ERRCODE = 'P0002';
+    END IF;
+
+    CASE lower(p_action)
+        WHEN 'submit' THEN CALL sp_submit_report(p_report_id, p_actor_id);
+        WHEN 'review' THEN CALL sp_start_review(p_report_id, p_actor_id);
+        WHEN 'approve' THEN CALL sp_approve_report(p_report_id, p_actor_id, p_comment);
+        WHEN 'reject' THEN CALL sp_reject_report(p_report_id, p_actor_id, p_comment);
+        WHEN 'reopen' THEN CALL sp_reopen_report(p_report_id, p_actor_id, p_comment);
+        ELSE RAISE EXCEPTION 'Unknown workflow action %', p_action;
+    END CASE;
+
+    SELECT * INTO r FROM reports WHERE id = p_report_id;
+    RETURN r;
+END;
+$$;
+
+-- p_changes keys: title, description, root_cause, risk_description, severity, status,
+-- location_details, site_location_id, observed_at. Missing keys are left unchanged.
+CREATE OR REPLACE FUNCTION api_update_issue(
+    p_issue_id uuid,
+    p_actor_id uuid,
+    p_changes jsonb,
+    p_comment text DEFAULT NULL
+)
+RETURNS issues
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    r issues%ROWTYPE;
+BEGIN
+    PERFORM fn_assert_active_user(p_actor_id);
+    PERFORM set_config('app.current_user_id', p_actor_id::text, true);
+    PERFORM set_config('app.status_comment', coalesce(p_comment, ''), true);
+
+    IF p_changes ?| ARRAY['title', 'description', 'root_cause', 'risk_description', 'site_location_id']
+       AND EXISTS (
+           SELECT 1
+           FROM report_issues ri
+           JOIN reports rp ON rp.id = ri.report_id
+           WHERE ri.issue_id = p_issue_id
+             AND rp.status = 'APPROVED'
+       ) THEN
+        RAISE EXCEPTION 'Issue appears in an APPROVED report; its text and location are frozen';
+    END IF;
+
+    UPDATE issues SET
+        title = CASE WHEN p_changes ? 'title' THEN p_changes->>'title' ELSE title END,
+        description = CASE WHEN p_changes ? 'description' THEN p_changes->>'description' ELSE description END,
+        root_cause = CASE WHEN p_changes ? 'root_cause' THEN p_changes->>'root_cause' ELSE root_cause END,
+        risk_description = CASE WHEN p_changes ? 'risk_description' THEN p_changes->>'risk_description' ELSE risk_description END,
+        severity = CASE WHEN p_changes ? 'severity' THEN (p_changes->>'severity')::issue_severity ELSE severity END,
+        status = CASE WHEN p_changes ? 'status' THEN (p_changes->>'status')::issue_status ELSE status END,
+        location_details = CASE WHEN p_changes ? 'location_details' THEN p_changes->>'location_details' ELSE location_details END,
+        site_location_id = CASE WHEN p_changes ? 'site_location_id' THEN (p_changes->>'site_location_id')::uuid ELSE site_location_id END,
+        observed_at = CASE WHEN p_changes ? 'observed_at' THEN (p_changes->>'observed_at')::timestamptz ELSE observed_at END
+    WHERE id = p_issue_id
+    RETURNING * INTO r;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Issue % not found', p_issue_id USING ERRCODE = 'P0002';
+    END IF;
+
+    PERFORM set_config('app.status_comment', '', true);
+    RETURN r;
+END;
+$$;
+
+-- Renumbers observations 1..N in report output order (section order, then observation order)
+CREATE OR REPLACE FUNCTION api_renumber_observations(p_report_id uuid)
+RETURNS SETOF report_issues
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM reports WHERE id = p_report_id) THEN
+        RAISE EXCEPTION 'Report % not found', p_report_id USING ERRCODE = 'P0002';
+    END IF;
+
+    -- Shift out of the way first: unique constraints are checked row by row
+    UPDATE report_issues
+    SET observation_no = observation_no + 100000,
+        display_order = display_order + 100000
+    WHERE report_id = p_report_id;
+
+    WITH ordered AS (
+        SELECT
+            ri.issue_id,
+            row_number() OVER (
+                ORDER BY coalesce(rs.display_order, 2147483647), ri.display_order
+            ) AS n
+        FROM report_issues ri
+        LEFT JOIN report_sections rs ON rs.id = ri.section_id
+        WHERE ri.report_id = p_report_id
+    )
+    UPDATE report_issues ri
+    SET observation_no = o.n,
+        display_order = o.n
+    FROM ordered o
+    WHERE ri.report_id = p_report_id
+      AND ri.issue_id = o.issue_id;
+
+    RETURN QUERY
+        SELECT * FROM report_issues WHERE report_id = p_report_id ORDER BY display_order;
+END;
+$$;
 
 -- =============================================================================
 -- 9. COMMENTS
