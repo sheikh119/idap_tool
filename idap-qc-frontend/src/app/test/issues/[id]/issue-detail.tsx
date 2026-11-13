@@ -64,6 +64,8 @@ export function IssueDetail({ id }: { id: string }) {
         {data.risk_description && <p className="text-sm"><strong>Risk:</strong> {data.risk_description}</p>}
       </Panel>
 
+      <ImagesPanel issueId={id} />
+
       <Panel
         title="Change status"
         description="PATCH /api/issues/:id { status, comment }. The comment is stored on the issue_history row."
@@ -173,6 +175,80 @@ export function IssueDetail({ id }: { id: string }) {
 
       <JsonView value={data} />
     </>
+  );
+}
+
+function ImagesPanel({ issueId }: { issueId: string }) {
+  const images = useQuery({
+    queryKey: ["issue-images", issueId],
+    queryFn: () => api<Row[]>(`/issues/${issueId}/images`),
+    staleTime: 0,
+  });
+  const upload = useApiMutation((body: FormData) => api<Row>(`/issues/${issueId}/images`, { method: "POST", body }));
+  const update = useApiMutation(({ imageId, body }: { imageId: string; body: Record<string, unknown> }) =>
+    api(`/issues/${issueId}/images/${imageId}`, { method: "PATCH", body }),
+  );
+  const remove = useApiMutation((imageId: string) => api(`/issues/${issueId}/images/${imageId}`, { method: "DELETE" }));
+
+  function submitUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    upload.mutate(new FormData(form), { onSuccess: () => form.reset() });
+  }
+
+  return (
+    <Panel
+      title={`Images · ${images.data?.length ?? 0}`}
+      description="POST /api/issues/:id/images (multipart). Stored at issue-images/<PROJECT>/<issue_id>/<image_id>.<ext>; shown via 1-hour signed URLs."
+    >
+      <ErrorNote error={images.error ?? update.error ?? remove.error} />
+      {images.data && images.data.length > 0 && (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {images.data.map((image) => (
+            <figure key={image.id} className="grid gap-2 rounded-lg border border-slate-200 p-2 text-xs">
+              {image.url ? (
+                <a href={image.url} target="_blank" rel="noreferrer">
+                  {/* eslint-disable-next-line @next/next/no-img-element -- signed URLs change every request */}
+                  <img src={image.url} alt={image.caption ?? image.original_filename} className="h-40 w-full rounded object-cover" />
+                </a>
+              ) : (
+                <p className="flex h-40 items-center justify-center rounded bg-slate-100 text-red-700">File missing in storage</p>
+              )}
+              <p className="font-mono text-[10px] break-all text-slate-500">{image.storage_path}</p>
+              <p>
+                #{image.display_order} · {image.original_filename} · {(image.file_size / 1024).toFixed(0)} KB
+              </p>
+              <Input
+                defaultValue={image.caption ?? ""}
+                placeholder="Caption (saved on blur)"
+                className="min-h-8 text-xs"
+                onBlur={(event) => {
+                  const caption = event.target.value.trim() || null;
+                  if (caption !== (image.caption ?? null)) update.mutate({ imageId: image.id, body: { caption } });
+                }}
+              />
+              <Button type="button" variant="ghost" onClick={() => remove.mutate(image.id)} disabled={remove.isPending}>
+                Delete image
+              </Button>
+            </figure>
+          ))}
+        </div>
+      )}
+      <form onSubmit={submitUpload} className="flex flex-wrap items-end gap-2">
+        <Field label="Image (JPEG, PNG or WebP, max 10 MB)">
+          <Input name="file" type="file" accept="image/jpeg,image/png,image/webp" required className="py-2" />
+        </Field>
+        <div className="min-w-64 flex-1">
+          <Field label="Caption">
+            <Input name="caption" />
+          </Field>
+        </div>
+        <Button type="submit" disabled={upload.isPending}>
+          {upload.isPending ? "Uploading…" : "Upload"}
+        </Button>
+      </form>
+      <ErrorNote error={upload.error} />
+    </Panel>
   );
 }
 

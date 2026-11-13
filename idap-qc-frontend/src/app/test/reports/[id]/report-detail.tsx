@@ -78,6 +78,7 @@ export function ReportDetail({ id }: { id: string }) {
       </Panel>
 
       <PayloadPanel id={id} />
+      <ReportFilePanel id={id} report={data} />
       <JsonView value={data} label="Raw GET /api/reports/:id" />
     </>
   );
@@ -544,6 +545,67 @@ function PayloadPanel({ id }: { id: string }) {
     >
       <ErrorNote error={payload.error} />
       {payload.data !== undefined && <JsonView value={payload.data} label="Payload" open />}
+    </Panel>
+  );
+}
+
+function ReportFilePanel({ id, report }: { id: string; report: Row }) {
+  const hasFile = Boolean(report.generated_file_path);
+  const file = useQuery({
+    queryKey: ["report-file", id, report.generated_file_path],
+    queryFn: () => api<{ path: string; url: string | null; download_url: string | null }>(`/reports/${id}/file`),
+    enabled: hasFile,
+    staleTime: 0,
+  });
+  const upload = useApiMutation((body: FormData) => api(`/reports/${id}/file`, { method: "POST", body }));
+  const remove = useApiMutation(() => api(`/reports/${id}/file`, { method: "DELETE" }));
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    upload.mutate(new FormData(form), { onSuccess: () => form.reset() });
+  }
+
+  return (
+    <Panel
+      title="Generated document"
+      description={`/api/reports/:id/file. Until the generator exists, upload a PDF/DOCX by hand. Stored at reports/${report.project_code}/${report.document_no}.<ext> and allowed even on APPROVED reports.`}
+    >
+      <ErrorNote error={file.error ?? remove.error} />
+      {hasFile && file.data && (
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <span className="font-mono text-xs">{file.data.path}</span>
+          {file.data.url && (
+            <a href={file.data.url} target="_blank" rel="noreferrer" className="text-teal-800 underline">
+              Open
+            </a>
+          )}
+          {file.data.download_url && (
+            <a href={file.data.download_url} className="text-teal-800 underline">
+              Download
+            </a>
+          )}
+          <Button type="button" variant="ghost" onClick={() => remove.mutate()} disabled={remove.isPending}>
+            Remove file
+          </Button>
+        </div>
+      )}
+      {!hasFile && <p className="text-sm text-slate-500">No file yet.</p>}
+      <form onSubmit={submit} className="flex flex-wrap items-end gap-2">
+        <Field label={hasFile ? "Replace with (PDF or DOCX, max 50 MB)" : "Upload (PDF or DOCX, max 50 MB)"}>
+          <Input
+            name="file"
+            type="file"
+            required
+            accept="application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            className="py-2"
+          />
+        </Field>
+        <Button type="submit" disabled={upload.isPending}>
+          {upload.isPending ? "Uploading…" : "Upload"}
+        </Button>
+      </form>
+      <ErrorNote error={upload.error} />
     </Panel>
   );
 }

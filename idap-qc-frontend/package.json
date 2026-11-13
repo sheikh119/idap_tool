@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:storage": "node scripts/test-storage.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.9.1",

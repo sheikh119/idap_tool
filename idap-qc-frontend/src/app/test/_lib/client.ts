@@ -50,13 +50,14 @@ export async function rawApi(path: string, { method = "GET", body, sendActor = t
   const headers: Record<string, string> = { Accept: "application/json" };
   const actor = getActorId();
   if (sendActor && actor) headers[ACTOR_HEADER] = actor;
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const isForm = body instanceof FormData;
+  if (body !== undefined && !isForm) headers["Content-Type"] = "application/json";
 
   const started = performance.now();
   const response = await fetch(`/api${path}`, {
     method,
     headers,
-    body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+    body: body === undefined ? undefined : isForm || typeof body === "string" ? (body as BodyInit) : JSON.stringify(body),
   });
   const json = await response.json().catch(() => null);
   return { status: response.status, ok: response.ok, ms: Math.round(performance.now() - started), json };
